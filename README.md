@@ -26,7 +26,7 @@ Dieses Projekt bietet ein einfaches grafisches Interface, um Python-Skripte mitt
 Hier siehst du, wie die Oberfläche aussieht:
 
 
-::contentReference[oaicite:0]{index=0}
+[::contentReference[oaicite:0]{index=0}](https://github.com/JoelCampoint/smart-installer/blob/main/screenshot.png)
 
 
 > **Hinweis:** Falls es sich bei dem Screenshot nicht um deine tatsächliche GUI handelt, ersetze das Bild entsprechend.
