@@ -1,2 +1,2 @@
 # smart-installer
-Ein GUI basierter Pyexe Python Compiler
+Ein GUI basierter pyexe Python Compiler
