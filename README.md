@@ -11,7 +11,7 @@ Ein GUI-basierter **pyexe Python Compiler**
 - [Installation & Nutzung](#installation--nutzung)  
 - [Voraussetzungen](#voraussetzungen)  
 - [Dateiübersicht](#dateiübersicht)  
-- [Lizenz](#lizenz)  
+- [Lizenz / License](#lizenz--license)
 
 ---
 
@@ -25,12 +25,9 @@ Dieses Projekt bietet ein einfaches grafisches Interface, um Python-Skripte mitt
 
 Hier siehst du, wie die Oberfläche aussieht:
 
-
 ![GUI Screenshot](screenshot.png)
 
 
-
-> **Hinweis:** Falls es sich bei dem Screenshot nicht um deine tatsächliche GUI handelt, ersetze das Bild entsprechend.
 
 ---
 
