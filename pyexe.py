@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# --- Silence early SyntaxWarning from peutils (must be the very first lines) ---
+import warnings as _w
+_w.filterwarnings("ignore", category=SyntaxWarning, module=r"^peutils$")
+# fallback, falls die Modul-Filterung mal nicht greift:
+_w.filterwarnings("ignore", message=r"invalid escape sequence .*", category=SyntaxWarning)
+try:
+    import peutils  # pre-import under active filter so later imports are no-ops
+except Exception:
+    pass
+# --- end ---
+
 import os
 import sys
 import re
@@ -14,6 +25,7 @@ import subprocess
 import sysconfig
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -98,6 +110,27 @@ def is_third_party(mod: str, stdlib: set, pkg_map: dict) -> bool:
         return True
 
 
+# ---- FIX: sichere Extraktion von String-Literalen aus AST-Knoten (ohne ast.Str/.s) ----
+def _extract_str_constant(node: ast.AST) -> Optional[str]:
+    """
+    Liefert den String-Wert aus einem AST-Knoten, falls dieser eine String-Konstante ist.
+    Auf modernen Pythons (>=3.8) ausschließlich über ast.Constant.
+    Fallback auf ast.Str nur, falls ast.Constant nicht existiert (sehr alte Versionen).
+    """
+    Constant = getattr(ast, "Constant", None)
+    if Constant is not None and isinstance(node, Constant):
+        val = getattr(node, "value", None)
+        return val if isinstance(val, str) else None
+
+    # Fallback nur für sehr alte Pythons; auf modernen führt dies nicht zu DeprecationWarnings
+    if Constant is None:
+        Str = getattr(ast, "Str", None)
+        if Str is not None and isinstance(node, Str):
+            return getattr(node, "s", None)
+
+    return None
+
+
 def parse_imports_from_file(py_file: Path) -> tuple[set, set]:
     imports = set()
     dynamic = set()
@@ -113,19 +146,28 @@ def parse_imports_from_file(py_file: Path) -> tuple[set, set]:
                 if node.module:
                     imports.add(top_level_module(node.module))
             elif isinstance(node, ast.Call):
-                # importlib.import_module("x.y")
+                # importlib.import_module("x.y")  oder  __import__("x.y")
                 try:
                     func_name = ""
                     if isinstance(node.func, ast.Attribute):
                         func_name = node.func.attr
                     elif isinstance(node.func, ast.Name):
                         func_name = node.func.id
-                    if func_name == "import_module" and node.args:
-                        a0 = node.args[0]
-                        if isinstance(a0, ast.Str):
-                            dynamic.add(top_level_module(a0.s))
-                        elif isinstance(a0, ast.Constant) and isinstance(a0.value, str):
-                            dynamic.add(top_level_module(a0.value))
+
+                    if func_name in {"import_module", "__import__"}:
+                        mod = None
+                        # Positional arg
+                        if node.args:
+                            mod = _extract_str_constant(node.args[0])
+                        # Keyword-arg (name=/module=)
+                        if mod is None:
+                            for kw in (node.keywords or []):
+                                if kw.arg in {"name", "module"}:
+                                    mod = _extract_str_constant(kw.value)
+                                    if mod:
+                                        break
+                        if mod:
+                            dynamic.add(top_level_module(mod))
                 except Exception:
                     pass
     except Exception:
@@ -233,11 +275,37 @@ def ensure_pyinstaller_available(log_cb) -> tuple[bool, str]:
         return False, ""
 
 
+def _with_peutils_syntaxwarning_filter_env(env: Optional[dict] = None) -> dict:
+    """
+    Ergänzt die Umgebungsvariable PYTHONWARNINGS um eine gezielte
+    Unterdrückung der bekannten SyntaxWarning aus dem Modul 'peutils'.
+    Wirkt in Subprozessen (pip/PyInstaller).
+    """
+    if env is None:
+        env = os.environ.copy()
+    rule = "ignore::SyntaxWarning:peutils"
+    existing = env.get("PYTHONWARNINGS", "")
+    if existing:
+        parts = [p.strip() for p in existing.split(",") if p.strip()]
+        if rule not in parts:
+            env["PYTHONWARNINGS"] = existing + "," + rule
+    else:
+        env["PYTHONWARNINGS"] = rule
+    return env
+
+
 def install_pyinstaller(log_cb) -> bool:
     try:
         log_cb("Installiere/aktualisiere PyInstaller …")
         cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "pyinstaller"]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            env=_with_peutils_syntaxwarning_filter_env(),
+        )
         for line in p.stdout:  # type: ignore
             log_cb(line.rstrip())
         rc = p.wait()
@@ -263,6 +331,9 @@ def build_command(
     collect_all_pkgs: list[str],
     extra_paths: list[Path] | None,
     noconfirm: bool = True,
+    version_file: Path | None = None,    # NEW
+    noupx: bool = False,                 # NEW
+    runtime_tmpdir: Optional[str] = None # NEW
 ) -> list[str]:
     cmd = [sys.executable, "-m", "PyInstaller"]
     if clean:
@@ -285,6 +356,12 @@ def build_command(
     if extra_paths:
         for ep in extra_paths:
             cmd += ["--paths", quote_path(ep)]
+    if noupx:
+        cmd.append("--noupx")  # Do not use UPX even if available
+    if runtime_tmpdir:
+        cmd += ["--runtime-tmpdir", runtime_tmpdir]
+    if version_file and version_file.exists():
+        cmd += ["--version-file", quote_path(version_file)]
     cmd.append(quote_path(script_path))
     return cmd
 
@@ -305,7 +382,7 @@ class BuilderGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("1080x720")
+        root.geometry("1080x820")
 
         self.log_queue = queue.Queue()
         self.build_thread = None
@@ -319,6 +396,17 @@ class BuilderGUI:
         self.scan_all_var = tk.BooleanVar(value=True)
         self.auto_data_dirs_var = tk.BooleanVar(value=True)
         self.collect_all_var = tk.BooleanVar(value=True)
+
+        # NEW: zusätzliche Optionen/Metadaten
+        self.noupx_var = tk.BooleanVar(value=True)
+        self.runtime_tmpdir_var = tk.StringVar()
+        self.use_versioninfo_var = tk.BooleanVar(value=True)
+
+        self.publisher_var = tk.StringVar()
+        self.product_var = tk.StringVar()
+        self.version_var = tk.StringVar(value="1.0.0")
+        self.desc_var = tk.StringVar()
+        self.copyright_var = tk.StringVar()
 
         self.extra_paths: list[Path] = []
         self.manual_datas: list[tuple[Path, str]] = []
@@ -369,6 +457,12 @@ class BuilderGUI:
         ttk.Checkbutton(opts, text="Standard-Datenordner einbinden", variable=self.auto_data_dirs_var).grid(row=1, column=1, sticky="w")
         ttk.Checkbutton(opts, text="Sammele Daten zu großen Paketen (--collect-all)", variable=self.collect_all_var).grid(row=1, column=2, sticky="w")
 
+        # NEW: zusätzliche Optionen in opts
+        ttk.Checkbutton(opts, text="UPX deaktivieren (--noupx)", variable=self.noupx_var).grid(row=2, column=0, sticky="w")
+        ttk.Label(opts, text="Runtime-Tmpdir (--runtime-tmpdir):").grid(row=2, column=1, sticky="e")
+        rtmp = ttk.Entry(opts, textvariable=self.runtime_tmpdir_var, width=36)
+        rtmp.grid(row=2, column=2, sticky="ew")
+
         lists = ttk.Frame(self.root)
         lists.pack(fill="both", expand=True, **pad)
 
@@ -405,6 +499,22 @@ class BuilderGUI:
         paths_btns.pack(fill="x")
         ttk.Button(paths_btns, text="Pfad hinzufügen…", command=self._add_extra_path).pack(side="left")
         ttk.Button(paths_btns, text="Aus Liste entfernen", command=self._remove_selected_paths).pack(side="left")
+
+        # NEW: Metadaten-Box
+        meta = ttk.LabelFrame(self.root, text="Metadaten (Windows-Versioninfos)")
+        meta.pack(fill="x", **pad)
+        ttk.Checkbutton(meta, text="Versioninfos einbetten (--version-file)", variable=self.use_versioninfo_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(meta, text="Publisher/Firma:").grid(row=1, column=0, sticky="e")
+        ttk.Entry(meta, textvariable=self.publisher_var).grid(row=1, column=1, sticky="ew")
+        ttk.Label(meta, text="Produktname:").grid(row=2, column=0, sticky="e")
+        ttk.Entry(meta, textvariable=self.product_var).grid(row=2, column=1, sticky="ew")
+        ttk.Label(meta, text="Version:").grid(row=3, column=0, sticky="e")
+        ttk.Entry(meta, textvariable=self.version_var, width=16).grid(row=3, column=1, sticky="w")
+        ttk.Label(meta, text="Beschreibung:").grid(row=4, column=0, sticky="e")
+        ttk.Entry(meta, textvariable=self.desc_var).grid(row=4, column=1, sticky="ew")
+        ttk.Label(meta, text="Copyright:").grid(row=5, column=0, sticky="e")
+        ttk.Entry(meta, textvariable=self.copyright_var).grid(row=5, column=1, sticky="ew")
+        meta.columnconfigure(1, weight=1)
 
         act = ttk.Frame(self.root)
         act.pack(fill="x", **pad)
@@ -605,6 +715,45 @@ class BuilderGUI:
         s = set(self.detected_imports) | set(self.detected_dynamic) | set(self.manual_hidden)
         return sorted(s)
 
+    # --- NEW: Versioninfo-Datei erzeugen (Windows) ---------------------------
+    @staticmethod
+    def _parse_version_tuple(s: str) -> tuple[int, int, int, int]:
+        parts = [p for p in re.split(r"[^\d]+", s) if p][:4]
+        nums = [int(x) for x in parts[:4]]
+        return tuple((nums + [0, 0, 0, 0])[:4])  # (major, minor, patch, build)
+
+    def _write_version_file(self, exe_name: str) -> Optional[Path]:
+        if os.name != "nt" or not self.use_versioninfo_var.get():
+            return None
+        vmaj, vmin, vpatch, vbuild = self._parse_version_tuple(self.version_var.get() or "1.0.0.0")
+        content = f'''# UTF-8
+# auto-generated by Smart PyInstaller Builder
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=({vmaj}, {vmin}, {vpatch}, {vbuild}),
+    prodvers=({vmaj}, {vmin}, {vpatch}, {vbuild}),
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([StringTable('040904E4', [
+      StringStruct('CompanyName', u'{self.publisher_var.get()}'),
+      StringStruct('FileDescription', u'{self.desc_var.get() or exe_name}'),
+      StringStruct('FileVersion', u'{self.version_var.get()}'),
+      StringStruct('InternalName', u'{exe_name}'),
+      StringStruct('LegalCopyright', u'{self.copyright_var.get()}'),
+      StringStruct('OriginalFilename', u'{exe_name}.exe'),
+      StringStruct('ProductName', u'{self.product_var.get() or exe_name}'),
+      StringStruct('ProductVersion', u'{self.version_var.get()}'),
+      StringStruct('Comments', u'Build: {datetime.now().isoformat(timespec="seconds")}')
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+'''
+        dst = Path(self.script_var.get()).parent / f"{exe_name}.versioninfo.txt"
+        dst.write_text(content, encoding="utf-8")
+        return dst
+
     def _build(self):
         script = Path(self.script_var.get().strip()) if self.script_var.get().strip() else None
         if not script or not script.exists():
@@ -625,6 +774,8 @@ class BuilderGUI:
         collect_all_pkgs = self.detected_collect_all if self.collect_all_var.get() else []
         extra_paths = self.extra_paths
 
+        version_file = self._write_version_file(name)
+
         cmd = build_command(
             script_path=script,
             name=name,
@@ -636,6 +787,9 @@ class BuilderGUI:
             hidden_imports=hidden_imports,
             collect_all_pkgs=collect_all_pkgs,
             extra_paths=extra_paths,
+            version_file=version_file,
+            noupx=self.noupx_var.get(),
+            runtime_tmpdir=(self.runtime_tmpdir_var.get().strip() or None),
         )
         self._log("Starte Build:")
         self._log(" ".join(shlex.quote(x) for x in cmd))
@@ -650,7 +804,15 @@ class BuilderGUI:
 
     def _run_build(self, cmd: list[str], cwd: Path):
         try:
-            p = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
+            p = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                env=_with_peutils_syntaxwarning_filter_env(),
+            )
             for line in p.stdout:  # type: ignore
                 self._log(line.rstrip())
             rc = p.wait()
@@ -692,6 +854,17 @@ class BuilderGUI:
             "extra_paths": [str(p) for p in self.extra_paths],
             "manual_datas": [(str(p), dest) for p, dest in self.manual_datas],
             "manual_hidden": list(self.manual_hidden),
+            # NEW
+            "noupx": self.noupx_var.get(),
+            "runtime_tmpdir": self.runtime_tmpdir_var.get(),
+            "profile_meta": {
+                "use_versioninfo": self.use_versioninfo_var.get(),
+                "publisher": self.publisher_var.get(),
+                "product": self.product_var.get(),
+                "version": self.version_var.get(),
+                "description": self.desc_var.get(),
+                "copyright": self.copyright_var.get(),
+            },
         }
         fn = Path(script).with_suffix(PROFILE_SUFFIX)
         fn.write_text(json.dumps(profile, indent=2), encoding="utf-8")
@@ -718,6 +891,19 @@ class BuilderGUI:
             self.extra_paths = [Path(p) for p in profile.get("extra_paths", [])]
             self.manual_datas = [(Path(p), dest) for p, dest in profile.get("manual_datas", [])]
             self.manual_hidden = list(profile.get("manual_hidden", []))
+
+            # NEW: weitere Felder
+            self.noupx_var.set(bool(profile.get("noupx", True)))
+            self.runtime_tmpdir_var.set(profile.get("runtime_tmpdir", ""))
+
+            m = profile.get("profile_meta", {})
+            self.use_versioninfo_var.set(bool(m.get("use_versioninfo", True)))
+            self.publisher_var.set(m.get("publisher", ""))
+            self.product_var.set(m.get("product", ""))
+            self.version_var.set(m.get("version", "1.0.0"))
+            self.desc_var.set(m.get("description", ""))
+            self.copyright_var.set(m.get("copyright", ""))
+
             self._analyze()
             self._refresh_datas_list()
             self._refresh_paths_list()
